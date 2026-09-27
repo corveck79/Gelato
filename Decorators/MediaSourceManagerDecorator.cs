@@ -149,66 +149,90 @@ public sealed class MediaSourceManagerDecorator(
         }
         else if (uri is not null && !isStreamRow && !manager.HasStreamSync(cacheKey, syncItemId))
         {
+            // ---- speed-patch (corveck79/Gelato, branch speed-patch — see README) ----
+            // A bare detail view (GetItem) is an insertable action too, so it used to block here
+            // exactly like a playback request: the whole response waited for SyncStreams, which
+            // means every first look at a title paid for a full addon round trip plus the
+            // per-stream DB writes before the page could even render. A detail view has nothing
+            // to show from that sync until Play is pressed, so only a genuine playback-info call
+            // is made to wait for it now; every other insertable action lets it finish in the
+            // background instead. Captured up front, since IHttpContextAccessor.HttpContext is
+            // gone once the request that reached here has moved on to the next one.
+            var isPlaybackIntent = _http.ReadRequest(ctx => ctx.IsPlaybackInfoAction(), false);
+
             // Bug in web UI that calls the detail page twice. So that's why there's a lock.
-            _lock
-                .RunSingleFlightAsync(
-                    item.Id,
-                    async ct =>
+            var syncOp = _lock.RunSingleFlightAsync(
+                item.Id,
+                async ct =>
+                {
+                    _log.LogDebug("GetStaticMediaSources refreshing streams for {Id}", item.Id);
+
+                    // Prewarm subtitle cache in the background if Gelato Subtitles
+                    // is enabled for this library.
+                    var libraryOptions = _libraryManager.GetLibraryOptions(item);
+                    var subtitlePrewarmEnabled =
+                        libraryOptions.SubtitleDownloadLanguages?.Length > 0
+                        && !libraryOptions.DisabledSubtitleFetchers.Contains(
+                            "Gelato Subtitles",
+                            StringComparer.OrdinalIgnoreCase
+                        );
+
+                    if (subtitlePrewarmEnabled)
                     {
-                        _log.LogDebug("GetStaticMediaSources refreshing streams for {Id}", item.Id);
-
-                        // Prewarm subtitle cache in the background if Gelato Subtitles
-                        // is enabled for this library.
-                        var libraryOptions = _libraryManager.GetLibraryOptions(item);
-                        var subtitlePrewarmEnabled =
-                            libraryOptions.SubtitleDownloadLanguages?.Length > 0
-                            && !libraryOptions.DisabledSubtitleFetchers.Contains(
-                                "Gelato Subtitles",
-                                StringComparer.OrdinalIgnoreCase
-                            );
-
-                        if (subtitlePrewarmEnabled)
+                        _ = Task.Run(async () =>
                         {
-                            _ = Task.Run(async () =>
+                            try
                             {
-                                try
-                                {
-                                    await _subtitleProvider
-                                        .Value.GetSubtitlesAsync(
-                                            uri.ExternalId,
-                                            uri.MediaType,
-                                            CancellationToken.None
-                                        )
-                                        .ConfigureAwait(false);
-                                }
-                                catch (Exception ex)
-                                {
-                                    _log.LogWarning(ex, "Subtitle prewarm failed for {Uri}", uri);
-                                }
-                            });
-                        }
-
-                        try
-                        {
-                            var count = await manager
-                                .SyncStreams(item, userId, ct)
-                                .ConfigureAwait(false);
-                            if (count > 0)
-                            {
-                                manager.SetStreamSync(cacheKey);
+                                await _subtitleProvider
+                                    .Value.GetSubtitlesAsync(
+                                        uri.ExternalId,
+                                        uri.MediaType,
+                                        CancellationToken.None
+                                    )
+                                    .ConfigureAwait(false);
                             }
-                        }
-                        catch (Exception ex)
+                            catch (Exception ex)
+                            {
+                                _log.LogWarning(ex, "Subtitle prewarm failed for {Uri}", uri);
+                            }
+                        });
+                    }
+
+                    try
+                    {
+                        var count = await manager
+                            .SyncStreams(item, userId, ct)
+                            .ConfigureAwait(false);
+                        if (count > 0)
                         {
-                            _log.LogError(ex, "Failed to sync streams for {Id}", item.Id);
+                            manager.SetStreamSync(cacheKey);
                         }
                     }
-                )
-                .GetAwaiter()
-                .GetResult();
+                    catch (Exception ex)
+                    {
+                        _log.LogError(ex, "Failed to sync streams for {Id}", item.Id);
+                    }
+                }
+            );
 
-            // refresh item
-            libraryManager.GetItemById(item.Id);
+            if (isPlaybackIntent)
+            {
+                syncOp.GetAwaiter().GetResult();
+
+                // refresh item
+                libraryManager.GetItemById(item.Id);
+            }
+            else
+            {
+                // speed-patch: a plain detail view does not wait for this — the lambda above
+                // still runs it to completion in the background and logs its own errors, so the
+                // streams are normally in place well before the user reaches the play button.
+                _log.LogDebug(
+                    "GetStaticMediaSources: deferring stream sync to the background for {Id} (not a playback request)",
+                    item.Id
+                );
+            }
+            // ---- end speed-patch ----
         }
 
         var itemId = item.Id.ToString("N", CultureInfo.InvariantCulture);

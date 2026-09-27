@@ -1,72 +1,104 @@
-> [!NOTE]
-> Looking for the next evolution of Gelato?
-> Check out [Remux](https://github.com/lostb1t/remux). A Rust-based media server designed as a full replacement for Jellyfin rather than a plugin. It supports local libraries, remote sources, Stremio addons, and works with existing Jellyfin clients.
+# Gelato — speed-patch fork
 
-<div align="center">
-   <img width="125" src="logo.png" alt="Logo">
-</div>
+This is a personal fork of [lostb1t/Gelato](https://github.com/lostb1t/Gelato)
+(the on-demand Stremio-catalog plugin for Jellyfin), patched for one thing:
+**opening a title you've never seen before shouldn't be slow to *look at*.**
 
-<div align="center">
-  <h1><b>Gelato</b></h1>
-  <p><i>Jellyfin Stremio Integration Plugin</i></p>
-</div>
+Everything else is unmodified upstream Gelato. This fork exists to be
+transparent about that one change, not to replace or compete with the
+original project — please use [upstream](https://github.com/lostb1t/Gelato)
+unless you specifically want this patch.
 
-Bring the power of Stremio addons directly into Jellyfin. This plugin replaces Jellyfin’s default search with Stremio-powered results and can automatically import entire catalogs into your library through scheduled tasks, seamlessly injecting them into Jellyfin’s database so they behave like native items.
+## What's patched
 
-<a href="https://discord.gg/rEbhk4RBhs">
-    <img src="https://img.shields.io/badge/Talk%20on-Discord-brightgreen">
-</a>
+**Branch:** [`speed-patch`](https://github.com/corveck79/Gelato/tree/speed-patch),
+based on upstream `main` at the time of writing (three commits ahead of the
+`v0.26.20.0` release: two scheduled-task fixes and a housekeeping commit,
+none of which touch the file below).
 
-### Features
-- **Unified Search** – Jellyfin search now pulls results from Stremio addons
-- **Catalogs** – Import items from stremio catalogs into your library with scheduled tasks
-- **Realtime Streaming** – Streams are resolved on demand and play instantly
-- **Database Integration** – Stremio items appear like native Jellyfin items
-- **Act as a proxy** - Streams are proxied through Jellyfin, so debrid sees everything as a single IP.
-- **Per user settings** - Users can have their own manifest, perfect for age restricted accounts.
-- **More Content, Less Hassle** – Expand Jellyfin with community-driven Stremio catalogs
+**File changed:** `Decorators/MediaSourceManagerDecorator.cs`, one method
+(`GetStaticMediaSources`). Nothing else.
 
-## Usage
+### The problem
 
-1. Set up an AIOStreams manifest. You can self-host or use a public instance, for example: [Elfhosted public instance](https://aiostreams.elfhosted.com/stremio/configure)
-   
-   If you are new to debrid and are signing up please use one of my <a href="https://github.com/lostb1t/Gelato?tab=readme-ov-file#support-me">referrals</a>.
-   
-   At minimum, you need the **tmdb addon enabled** for search and one addon that provides streams (comet for example).
-   Alternatively, you can import the [starter config](aiostreams-config.json). Remember to enable your debrid providers under services after importing the config.
+Gelato materializes a title (creates the Jellyfin item, fetches its
+metadata, syncs its available streams from your Stremio addon) the first
+time something *opens* it — not when it's added to a catalog. That's the
+whole point of the addon-backed model: nothing is imported until someone
+actually looks at it.
 
-2. Make sure you are running Jellyfin 12 and add `https://raw.githubusercontent.com/lostb1t/Gelato/refs/heads/gh-pages/repository.json` to your plugin repositories.
+The trouble is *what counts as "opens it"*. Gelato's own `IsInsertableAction`
+check treats a plain detail-page view (`GET /Users/{id}/Items/{id}`) the
+same as an actual playback request (`PlaybackInfo`). Both used to block on
+`GelatoManager.SyncStreams` — a full round trip to your Stremio addon plus a
+database write of every stream row it returns — before the response went
+out. Measured on a real server (AMD system, SSD-backed SQLite, addon
+answering in ~1–2s):
 
-   **Upgrading from Jellyfin 10.11?** Update Gelato to the final 10.11 release first and shut the server down normally at least once before upgrading Jellyfin. The first Jellyfin 12 start deletes every Gelato item unless that release has emptied the Gelato library folders on shutdown, and its settings page shows whether the install is ready. If you upgraded without it, Gelato runs the repair watch state task once on the first start and recovers whatever still has watch state (see the FAQ).
+| Request | Before | After |
+|---|---|---|
+| Detail view of a **new** title | 2–4s | ~0.7s (once the sync has finished in the background) |
+| `PlaybackInfo` (Play) | unchanged | unchanged — still waits for the sync |
 
-3. Install and configure the plugin.
-   **Note:** Only **AIOStreams** is supported.
+So: reading a synopsis and looking at a poster cost the same network round
+trip as actually starting a stream, before you'd even touched Play.
 
-4. Add the configured base paths to the Jellyfin library of your choice. After adding them, start a library scan.
-   4.5 For shows, enable the "Gelato missing season/episode fetcher" and put it on top of the metadata downloaders.
+### The fix
 
-5. Profit! Now search for your favorite movie and start streaming. Or run the catalog import task to populate your db.
+In `GetStaticMediaSources`, the stream sync now only *blocks the response*
+when the request is genuinely about to play something
+(`ctx.IsPlaybackInfoAction()` — covers both the GET and POST `PlaybackInfo`
+actions Jellyfin's various clients use). Every other insertable action —
+the detail view chief among them — still *starts* the exact same
+single-flighted sync (so a second near-simultaneous request doesn't
+duplicate the work, same as before), it just doesn't wait for it. The sync
+finishes in the background and is normally done well before anyone reaches
+the play button; if they get there first, `PlaybackInfo` waits for it
+exactly as the unpatched code always did.
 
-For a more in depth guide see [starter guide](https://github.com/lostb1t/Gelato/discussions/40)
+Nothing about *what* gets synced, cached (`StreamTTL`), or written changes.
+No config option, no new setting — same behavior for playback, faster
+response for everything that isn't.
 
-## Notes
+Full rationale is in the patch's inline comments and its
+[commit message](https://github.com/corveck79/Gelato/commits/speed-patch).
 
-- Only **AIOStreams** is supported
+### What this does *not* fix
 
-### FAQ
+This patch only addresses the stream-sync half of a first open. The other
+half — the metadata fetch that creates the item in the first place
+(`GelatoManager.InsertMeta`, including, for movies, an extra TMDB lookup for
+digital release dates) — is unchanged and still happens synchronously.
+Measured at roughly 0.5–1.5s depending on the addon's response time. A
+brand-new title's detail view is therefore faster than before, not
+instant.
 
-- You need to restart the server after editing the manifest/config in aiostreams.
-- You should have at least one search enabled catalog. I suggest the tmdb addon.
-- If something borked or you want to start over, you can use the purge task under scheduled tasks. It clears watch state along with the items, so it really is a fresh start.
-- Watch state is not lost when items are removed. Jellyfin parks it and Gelato puts it back when the item returns, so a film you delete and later re-add still has your progress on it.
-- If items went missing and took your watch state with them (after a Jellyfin 12 upgrade, say), run the **repair watch state** task under scheduled tasks. It re-imports what is gone and reattaches the watch state. It has no schedule: it cannot tell what you deleted on purpose from what you lost by accident, so it only runs when you start it, and it will bring back things you deleted yourself. Gelato also runs it once by itself on the first start after this release is installed and after every later Jellyfin major upgrade. Do not run Jellyfin's own "clean up user data" task first, that is what actually deletes parked watch state.
-- I suggest lowering the default timeout on your stremio addons in aiostreams (5 seconds for example)
-- debridio tmdb and debridio tvdb are pronlematic. I suggest using the regular tmdb addon.
-- Stream cache can be cleared by restarting the server
+## Building
 
-### ❤️ Support the Project
+```sh
+git clone --branch speed-patch https://github.com/corveck79/Gelato.git
+cd Gelato
+dotnet publish -c Release
+```
 
-- ⭐ **[Star the repository](https://github.com/lostb1t/Gelato)** on GitHub.
-- 🤝 **Contribute**: Report issues, suggest features, or submit pull requests.
-- ☕ **Donate**:
-  - **[Ko-fi](https://ko-fi.com/lostb1t)**
+Targets the same Jellyfin ABI as upstream (`12.1.0.0`, see `build.yaml`).
+Built and tested against Jellyfin 12.1.0 / Gelato's own dependency set with
+the official `mcr.microsoft.com/dotnet/sdk:10.0` image.
+
+## Installing
+
+Drop the built `Gelato.dll` (and its unchanged dependency DLLs — MonoTorrent,
+Mono.Nat, ReusableTasks) into your existing Gelato plugin folder, replacing
+the upstream build. Everything else — config, catalogs, your library — is
+untouched; this only changes the compiled code.
+
+## License
+
+Gelato is [GPLv3](LICENSE). This fork keeps that license, unmodified, per
+section 5. The change described above is the modification required to be
+disclosed under section 5(a); this README and the branch name are that
+disclosure, and the patch commit carries the same notice inline.
+
+All credit for Gelato itself goes to [lostb1t](https://github.com/lostb1t)
+and its contributors — this fork adds one behavioral change on top of their
+work, nothing more.
